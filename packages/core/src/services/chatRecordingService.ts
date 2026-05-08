@@ -309,6 +309,12 @@ export class ChatRecordingService {
   private queuedThoughts: Array<ThoughtSummary & { timestamp: string }> = [];
   private queuedTokens: TokensSummary | null = null;
   private context: AgentLoopContext;
+  // Metadata header buffered for a brand-new (non-resumed) session. Written to
+  // disk on the first appendRecord so that an instance that gets discarded
+  // before any real record is appended (e.g. when the CLI immediately swaps
+  // in a resumed chat) leaves no orphan stub file behind. Stays null in the
+  // resumed path because the source file already contains its own metadata.
+  private pendingMetadata: object | null = null;
 
   constructor(context: AgentLoopContext) {
     this.context = context;
@@ -428,7 +434,7 @@ export class ChatRecordingService {
           directories,
         };
 
-        this.appendRecord(initialMetadata);
+        this.pendingMetadata = initialMetadata;
         this.cachedConversation = {
           ...initialMetadata,
           messages: [],
@@ -451,9 +457,14 @@ export class ChatRecordingService {
   private appendRecord(record: unknown): void {
     if (!this.conversationFile) return;
     try {
-      const line = JSON.stringify(record) + '\n';
       fs.mkdirSync(path.dirname(this.conversationFile), { recursive: true });
-      fs.appendFileSync(this.conversationFile, line);
+      let payload = '';
+      if (this.pendingMetadata) {
+        payload += JSON.stringify(this.pendingMetadata) + '\n';
+        this.pendingMetadata = null;
+      }
+      payload += JSON.stringify(record) + '\n';
+      fs.appendFileSync(this.conversationFile, payload);
     } catch (error) {
       if (isNodeError(error) && error.code === 'ENOSPC') {
         this.conversationFile = null;
@@ -671,6 +682,99 @@ export class ChatRecordingService {
 
   getConversationFilePath(): string | null {
     return this.conversationFile;
+  }
+
+  /**
+   * Saves a copy of the current conversation under a new sessionId so it can
+   * be resumed independently in another terminal. The fork is a stand-alone
+   * session file in the same chats directory; the active session is not
+   * mutated. Subagent sessions cannot be forked.
+   *
+   * @returns the new sessionId, its 8-character shortId, and the path of the
+   *          new file.
+   * @throws if there is no active conversation, the source file is missing,
+   *         the session is a subagent, or a filesystem error occurs (ENOSPC
+   *         is rethrown with a friendlier message).
+   */
+  async fork(): Promise<{
+    sessionId: string;
+    shortId: string;
+    filePath: string;
+  }> {
+    if (!this.conversationFile) {
+      throw new Error('No active conversation to fork.');
+    }
+    if (this.kind === 'subagent') {
+      throw new Error('Cannot fork a subagent session.');
+    }
+    try {
+      await fs.promises.access(this.conversationFile);
+    } catch {
+      throw new Error('Conversation file not found.');
+    }
+
+    const newSessionId = randomUUID();
+    const safeNewId = sanitizeFilenamePart(newSessionId);
+    if (!safeNewId) {
+      throw new Error(`Invalid sessionId after sanitization: ${newSessionId}`);
+    }
+    const shortId = safeNewId.slice(0, 8);
+
+    // Second-precision timestamp so two forks taken in the same minute
+    // produce distinct, sortable filenames.
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+    const filename = `${SESSION_FILE_PREFIX}${timestamp}-${shortId}.jsonl`;
+    const newPath = path.join(path.dirname(this.conversationFile), filename);
+
+    try {
+      await fs.promises.mkdir(path.dirname(newPath), { recursive: true });
+
+      const raw = await fs.promises.readFile(this.conversationFile, 'utf-8');
+      const lines = raw.split('\n');
+
+      let metadataRewritten = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line) as unknown;
+          if (!metadataRewritten && isPartialMetadataRecord(parsed)) {
+            // Only rewrite sessionId. Inheriting source startTime/lastUpdated
+            // keeps them consistent with any later $set:lastUpdated markers
+            // copied from the source, which loadConversationRecord folds
+            // back into metadata.
+            lines[i] = JSON.stringify({ ...parsed, sessionId: newSessionId });
+            metadataRewritten = true;
+          } else if (
+            isMetadataUpdateRecord(parsed) &&
+            hasProperty(parsed.$set, 'sessionId')
+          ) {
+            // Rewrite any later $set:sessionId markers to the fork id —
+            // loadConversationRecord folds every $set into metadata, so leaving
+            // the source's id here would cause the fork to be read with the
+            // source's id and shadow the rewritten header.
+            lines[i] = JSON.stringify({
+              ...parsed,
+              $set: { ...parsed.$set, sessionId: newSessionId },
+            });
+          }
+        } catch {
+          // Not a JSON line — keep scanning.
+        }
+      }
+      if (!metadataRewritten) {
+        throw new Error('Could not locate session metadata in source file.');
+      }
+
+      await fs.promises.writeFile(newPath, lines.join('\n'), 'utf-8');
+    } catch (error) {
+      if (isNodeError(error) && error.code === 'ENOSPC') {
+        throw new Error('No space left on device.');
+      }
+      throw error;
+    }
+
+    return { sessionId: newSessionId, shortId, filePath: newPath };
   }
 
   /**
